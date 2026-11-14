@@ -16,7 +16,11 @@ from dummyserver.testcase import (
 )
 from urllib3 import HTTPHeaderDict, HTTPResponse, request
 from urllib3.connectionpool import port_by_scheme
-from urllib3.exceptions import MaxRetryError, URLSchemeUnknown
+from urllib3.exceptions import (
+    MaxRetryError,
+    UnrewindableBodyError,
+    URLSchemeUnknown,
+)
 from urllib3.poolmanager import PoolManager
 from urllib3.util.retry import Retry
 
@@ -99,6 +103,35 @@ class TestPoolManager(DualHypercornDummyServerTestCase):
 
             assert r.status == 200
             assert r.data == b"Dummy server!"
+
+    def test_redirect_with_iterator_body(
+        self, pool_manager_factory: PoolManagerFactory
+    ) -> None:
+        """A 307 redirect keeps the body, which a one-shot iterator can't
+        replay, so the redirect must be refused instead of silently
+        re-sending an empty body."""
+        with pool_manager_factory() as http:
+            with pytest.raises(UnrewindableBodyError, match="one-shot iterator"):
+                http.request(
+                    "PUT",
+                    f"{self.base_url}/redirect"
+                    f"?target={self.base_url}/echo&status=307",
+                    body=iter([b"xxxxxxxx"]),
+                )
+
+    def test_redirect_replays_iterable_body(
+        self, pool_manager_factory: PoolManagerFactory
+    ) -> None:
+        """Re-iterable bodies (lists) are replayed in full on redirects"""
+        data = [b"A" * 65535, b"B" * 1024]
+        with pool_manager_factory() as http:
+            r = http.request(
+                "PUT",
+                f"{self.base_url}/redirect?target={self.base_url}/echo&status=307",
+                body=data,
+            )
+        assert r.status == 200
+        assert r.data == b"".join(data)
 
     @pytest.mark.parametrize(
         "retries",

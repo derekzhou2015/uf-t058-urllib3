@@ -25,7 +25,12 @@ from urllib3.exceptions import (
 from urllib3.util import is_fp_closed
 from urllib3.util.connection import _has_ipv6, allowed_gai_family, create_connection
 from urllib3.util.proxy import connection_requires_http_tunnel
-from urllib3.util.request import _FAILEDTELL, make_headers, rewind_body
+from urllib3.util.request import (
+    _FAILEDTELL,
+    is_replayable_body,
+    make_headers,
+    rewind_body,
+)
 from urllib3.util.response import assert_header_parsing
 from urllib3.util.ssl_ import (
     _is_has_never_check_common_name_reliable,
@@ -919,6 +924,46 @@ class TestUtil:
 
         with pytest.raises(UnrewindableBodyError):
             rewind_body(NoSeek(), body_pos=2)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            None,
+            b"bytes",
+            "string",
+            bytearray(b"bytearray"),
+            memoryview(b"memoryview"),
+            [b"list", b"of", b"chunks"],
+            (b"tuple", b"of", b"chunks"),
+            io.BytesIO(b"file-like"),
+        ],
+    )
+    def test_is_replayable_body_replayable(self, body: typing.Any) -> None:
+        # File-like objects are replayed via their recorded position.
+        body_pos = 0 if hasattr(body, "tell") else None
+        assert is_replayable_body(body, body_pos)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            iter([b"iterator"]),
+            (chunk for chunk in [b"generator"]),
+        ],
+    )
+    def test_is_replayable_body_one_shot_iterator(self, body: typing.Any) -> None:
+        assert not is_replayable_body(body, None)
+
+    def test_is_replayable_body_unseekable_stream(self) -> None:
+        class ReadOnly:
+            def read(self, size: int = -1) -> bytes:
+                return b""
+
+        # A file-like object without a recorded position can't be rewound.
+        assert not is_replayable_body(ReadOnly(), None)
+
+    def test_is_replayable_body_invalid_body(self) -> None:
+        # Not a valid body; body_to_chunks() raises the TypeError for it.
+        assert is_replayable_body(object(), None)
 
     def test_add_stderr_logger(self) -> None:
         handler = add_stderr_logger(level=logging.INFO)  # Don't actually print debug

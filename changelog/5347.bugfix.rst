@@ -1,0 +1,5 @@
+Fixed retries and redirects silently re-sending an empty request body when the
+body was given as a one-shot iterator, such as a generator. Such bodies cannot
+be replayed, so urllib3 now raises :class:`~urllib3.exceptions.UnrewindableBodyError`
+before following the retry or redirect instead of losing the uploaded data.
+Re-iterable bodies like lists are still replayed in full.

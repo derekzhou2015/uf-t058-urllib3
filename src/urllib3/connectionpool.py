@@ -38,11 +38,12 @@ from .exceptions import (
     ReadTimeoutError,
     SSLError,
     TimeoutError,
+    UnrewindableBodyError,
 )
 from .response import BaseHTTPResponse
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
-from .util.request import _TYPE_BODY_POSITION, set_file_position
+from .util.request import _TYPE_BODY_POSITION, is_replayable_body, set_file_position
 from .util.retry import Retry
 from .util.ssl_match_hostname import CertificateError
 from .util.timeout import _DEFAULT_TIMEOUT, _TYPE_DEFAULT, Timeout
@@ -62,6 +63,23 @@ log = logging.getLogger(__name__)
 
 _TYPE_TIMEOUT = typing.Union[Timeout, float, _TYPE_DEFAULT, None]
 _DEFAULT_QUEUE_CLASS = queue.LifoQueue
+
+
+def _ensure_replayable_body(
+    body: typing.Any, body_pos: _TYPE_BODY_POSITION | None
+) -> None:
+    """Raise if the request body can't be replayed for a redirect/retry.
+
+    Re-sending a one-shot iterator or an unseekable stream would silently
+    transmit an empty body, so refuse to follow the redirect/retry instead.
+    """
+    if not is_replayable_body(body, body_pos):
+        raise UnrewindableBodyError(
+            "Unable to replay the request body for a redirect/retry: "
+            "the body is a one-shot iterator or an unseekable stream. "
+            "Pass a bytes-like object, a re-iterable container, or a "
+            "seekable file-like object as the body instead."
+        )
 
 
 # Pool objects
@@ -872,6 +890,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 # See also: https://github.com/urllib3/urllib3/issues/2580.
                 extra={"__urllib3-retry-warning": {"host": self.host}},
             )
+            _ensure_replayable_body(body, body_pos)
             return self.urlopen(
                 method,
                 original_url,
@@ -928,6 +947,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             response.drain_conn()
             retries.sleep_for_retry(response)
             log.debug("Redirecting %s -> %s", url, redirect_location)
+            _ensure_replayable_body(body, body_pos)
             return self.urlopen(
                 method,
                 redirect_location,
@@ -960,6 +980,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             response.drain_conn()
             retries.sleep(response)
             log.debug("Retry: %s", url)
+            _ensure_replayable_body(body, body_pos)
             return self.urlopen(
                 method,
                 original_url,

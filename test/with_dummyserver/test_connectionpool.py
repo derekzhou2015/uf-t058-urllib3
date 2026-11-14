@@ -1541,6 +1541,61 @@ class TestFileBodiesOnRetryOrRedirect(DualHypercornDummyServerTestCase):
         assert resp.status == 200
         assert resp.data == b""
 
+    def test_retry_with_iterator_body(self, pool_factory: PoolFactory) -> None:
+        """A one-shot iterator body can't be replayed, so the retry must be
+        refused instead of silently re-sending an empty body."""
+        retry = Retry(total=1, status_forcelist=[200], raise_on_status=False)
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            with pytest.raises(UnrewindableBodyError, match="one-shot iterator"):
+                pool.urlopen(
+                    "PUT",
+                    "/echo",
+                    retries=retry,
+                    body=(chunk for chunk in [b"xxxxxxxx"]),
+                )
+
+    def test_redirect_with_iterator_body(self, pool_factory: PoolFactory) -> None:
+        """A 307 redirect keeps the body, which a one-shot iterator can't
+        replay, so the redirect must be refused."""
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            url = "/redirect?target=/echo&status=307"
+            with pytest.raises(UnrewindableBodyError, match="one-shot iterator"):
+                pool.urlopen("PUT", url, body=iter([b"xxxxxxxx"]), redirect=True)
+
+    def test_303_redirect_with_iterator_body(self, pool_factory: PoolFactory) -> None:
+        """A 303 drops the body, so an iterator body never needs replaying"""
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            url = "/redirect?target=/echo"
+            resp = pool.urlopen("PUT", url, body=iter([b"xxxxxxxx"]), redirect=True)
+        assert resp.status == 200
+        assert resp.data == b""
+
+    def test_retry_replays_iterable_body(self, pool_factory: PoolFactory) -> None:
+        """Re-iterable bodies (lists) are replayed in full on retries"""
+        retry = Retry(total=1, status_forcelist=[200], raise_on_status=False)
+        data = [b"A" * 65535, b"B" * 1024]
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            resp = pool.urlopen("PUT", "/echo", retries=retry, body=data)
+        assert resp.status == 200
+        # The echoed body comes from the retried request, proving the
+        # list body was replayed in full rather than sent empty.
+        assert resp.data == b"".join(data)
+        assert resp.retries is not None
+        assert len(resp.retries.history) == 1
+
+    def test_redirect_replays_iterable_body(self, pool_factory: PoolFactory) -> None:
+        """Re-iterable bodies (lists) are replayed in full on redirects"""
+        data = [b"A" * 65535, b"B" * 1024]
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            resp = pool.urlopen(
+                "PUT",
+                "/redirect?target=/echo&status=307",
+                body=data,
+                redirect=True,
+            )
+        assert resp.status == 200
+        assert resp.data == b"".join(data)
+
 
 class TestRetryPoolSize(DualHypercornDummyServerTestCase):
     def test_pool_size_retry(self, pool_factory: PoolFactory) -> None:

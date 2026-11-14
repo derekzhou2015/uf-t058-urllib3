@@ -13,6 +13,7 @@ from .connection import ProxyConfig
 from .connectionpool import (
     HTTPConnectionPool,
     HTTPSConnectionPool,
+    _ensure_replayable_body,
     _is_same_host,
     _normalize_host,
     port_by_scheme,
@@ -527,6 +528,7 @@ class PoolManager(RequestMethods):
 
         response.drain_conn()
         retries.sleep_for_retry(response)
+        _ensure_replayable_body(kw.get("body"), kw.get("body_pos"))
         return self.urlopen(method, redirect_location, **kw)
 
 

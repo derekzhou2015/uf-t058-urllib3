@@ -225,6 +225,35 @@ def rewind_body(body: typing.IO[typing.AnyStr], body_pos: _TYPE_BODY_POSITION) -
         )
 
 
+def is_replayable_body(
+    body: typing.Any, body_pos: _TYPE_BODY_POSITION | None
+) -> bool:
+    """Determine whether the request body can be sent again for a
+    redirect or a retry.
+
+    Bytes, strings, buffers and re-iterable containers (such as lists)
+    can be sent any number of times, and file-like objects are rewound
+    via their recorded position. One-shot iterators and file-like
+    objects without a recorded position are exhausted by the first
+    send, so re-sending them would silently transmit an empty body.
+    """
+    if body is None or body_pos is not None:
+        return True
+    if isinstance(body, (str, bytes)):
+        return True
+    if hasattr(body, "read"):
+        # A file-like object whose position couldn't be recorded
+        # can't be rewound.
+        return False
+    try:
+        # One-shot iterators are their own iterator, whereas
+        # re-iterable containers return a fresh one each time.
+        return iter(body) is not body
+    except TypeError:
+        # Not a valid body; body_to_chunks() raises a TypeError for it.
+        return True
+
+
 class ChunksAndContentLength(typing.NamedTuple):
     chunks: typing.Iterable[bytes] | None
     content_length: int | None
