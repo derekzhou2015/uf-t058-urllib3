@@ -215,6 +215,22 @@ The 16 KiB default was chosen to match OpenSSL's default read size. Application
 writes do not need to match TLS record or TCP packet sizes; TLS and TCP handle
 their own segmentation.
 
+.. _replayable_bodies:
+
+Replayable Bodies
+-----------------
+
+Retries and redirects have to send the request body again. File-like bodies are
+rewound to their recorded position, and ``bytes``, ``str``, ``bytearray`` and
+re-iterable containers such as ``list`` can always be sent again.
+
+One-shot iterators, such as generators and the result of ``iter([...])``,
+cannot: the first attempt consumes them, so a second attempt would send an
+empty body. Instead of silently uploading nothing,
+:class:`~urllib3.exceptions.UnrewindableBodyError` is raised before the retry
+or redirect is attempted. Pass a re-iterable container or a seekable file-like
+object as the body when a request may need to be retried or redirected.
+
 .. _proxies:
 
 Proxies

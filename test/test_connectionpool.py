@@ -10,7 +10,6 @@ from socket import error as SocketError
 from ssl import SSLError as BaseSSLError
 from test import SHORT_TIMEOUT
 from unittest.mock import Mock, patch
-
 import pytest
 
 from dummyserver.socketserver import DEFAULT_CA
@@ -744,6 +743,114 @@ class TestConnectionPool:
                         retries=Retry(total=2, allowed_methods=["POST"]),
                         body_pos=None,
                     )
+
+    def test_retry_rejects_consumed_iterator_body(self) -> None:
+        """A retried iterator body must be refused, not silently emptied.
+
+        The first attempt consumes the iterator. Previously the retry passed
+        the exhausted iterator on, the connection layer sent an empty chunked
+        body, and the server's success status hid the loss.
+        """
+        with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
+            calls = 0
+
+            def make_request(*args: typing.Any, **kwargs: typing.Any) -> HTTPResponse:
+                nonlocal calls
+                calls += 1
+                # The first attempt really consumes the body, as a send would.
+                for _ in kwargs["body"]:
+                    pass
+                if calls == 1:
+                    return HTTPResponse(status=503)
+                raise AssertionError("retry must not reach the server")
+
+            with patch.object(pool, "_make_request", side_effect=make_request):
+                with pytest.raises(
+                    UnrewindableBodyError,
+                    match="iterator that has already been consumed",
+                ):
+                    pool.urlopen(
+                        "PUT",
+                        "/",
+                        body=iter([b"payload"]),
+                        retries=Retry(total=2, status_forcelist=[503]),
+                    )
+
+            assert calls == 1
+
+    def test_redirect_rejects_consumed_iterator_body(self) -> None:
+        """A redirect that would re-send a consumed iterator must be refused."""
+        redirect_response = HTTPResponse(
+            status=307, headers={"location": "http://localhost/next"}
+        )
+        with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
+            calls = 0
+
+            def make_request(*args: typing.Any, **kwargs: typing.Any) -> HTTPResponse:
+                nonlocal calls
+                calls += 1
+                # The send consumes the iterator, as a real request would.
+                for _ in kwargs["body"]:
+                    pass
+                return redirect_response
+
+            with patch.object(pool, "_make_request", side_effect=make_request):
+                with pytest.raises(
+                    UnrewindableBodyError,
+                    match="iterator that has already been consumed",
+                ):
+                    pool.urlopen(
+                        "PUT",
+                        "/",
+                        body=(chunk for chunk in [b"payload"]),
+                        retries=Retry(total=2),
+                    )
+
+            # The redirect was never followed.
+            assert calls == 1
+
+    def test_retry_replays_unconsumed_iterator_body(self) -> None:
+        """An iterator that no attempt read yet is still sent in full."""
+        with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
+            make_request_calls = 0
+
+            def make_request(*args: typing.Any, **kwargs: typing.Any) -> HTTPResponse:
+                nonlocal make_request_calls
+                make_request_calls += 1
+                if make_request_calls == 1:
+                    # Fail before the body is read, like a connect error.
+                    raise OSError("connection reset")
+                return HTTPResponse(status=200)
+
+            with patch.object(pool, "_make_request", side_effect=make_request):
+                response = pool.urlopen(
+                    "PUT",
+                    "/",
+                    body=iter([b"payload"]),
+                    retries=Retry(total=2),
+                )
+
+            assert response.status == 200
+            assert make_request_calls == 2
+
+    def test_retry_with_replayable_bodies_is_unchanged(self) -> None:
+        """Re-iterable bodies keep their existing retry behaviour."""
+        for body in ([b"payload"], b"payload", bytearray(b"payload")):
+            with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
+                with patch.object(
+                    pool,
+                    "_make_request",
+                    side_effect=[OSError("connection reset"), HTTPResponse(status=200)],
+                ) as mock_request:
+                    response = pool.urlopen(
+                        "PUT", "/", body=body, retries=Retry(total=2)
+                    )
+
+                assert response.status == 200
+                assert mock_request.call_count == 2
+                # The body is handed to both attempts untouched.
+                sent = [call.kwargs["body"] for call in mock_request.call_args_list]
+                assert sent == [body, body]
 
     def test_read_timeout_0_does_not_raise_bad_status_line_error(self) -> None:
         with HTTPConnectionPool(host="localhost", maxsize=1) as pool:

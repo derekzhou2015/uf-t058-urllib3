@@ -26,6 +26,7 @@ from .exceptions import (
 from .response import BaseHTTPResponse
 from .util.connection import _TYPE_SOCKET_OPTIONS
 from .util.proxy import connection_requires_http_tunnel
+from .util.request import ensure_replayable_body, make_replayable_body
 from .util.retry import Retry
 from .util.timeout import Timeout
 from .util.url import Url, parse_url
@@ -464,6 +465,12 @@ class PoolManager(RequestMethods):
         if "headers" not in kw:
             kw["headers"] = self.headers
 
+        # PoolManager follows redirects itself, so it is the owner of the
+        # ``body`` across attempts, not the pool. Wrap a one-shot iterator once
+        # here; the pool's own wrapping is a no-op for the same object.
+        if "body" in kw:
+            kw["body"] = make_replayable_body(kw["body"])
+
         if self._proxy_requires_url_absolute_form(u):
             # Strip the fragment here but let the connection pool normalize the URL
             # to avoid decoding IPv6 zone identifiers twice.
@@ -526,6 +533,9 @@ class PoolManager(RequestMethods):
         log.info("Redirecting %s -> %s", url, redirect_location)
 
         response.drain_conn()
+        # The redirect is going to re-send the body, which a consumed iterator
+        # cannot do. Refuse rather than silently send nothing.
+        ensure_replayable_body(kw.get("body"))
         retries.sleep_for_retry(response)
         return self.urlopen(method, redirect_location, **kw)
 

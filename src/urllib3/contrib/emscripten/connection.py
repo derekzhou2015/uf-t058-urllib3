@@ -12,6 +12,7 @@ from ...connection import HTTPConnection, ProxyConfig, port_by_scheme
 from ...exceptions import TimeoutError
 from ...response import BaseHTTPResponse
 from ...util.connection import _TYPE_SOCKET_OPTIONS
+from ...util.request import mark_replayable_body_sent, unwrap_replayable_body
 from ...util.timeout import _DEFAULT_TIMEOUT, _TYPE_TIMEOUT
 from ...util.url import Url
 from .fetch import _RequestError, _TimeoutError, send_request, send_streaming_request
@@ -111,7 +112,10 @@ class EmscriptenHTTPConnection:
             timeout=self.timeout if self.timeout else 0,
             decode_content=decode_content,
         )
-        request.set_body(body)
+        request.set_body(unwrap_replayable_body(body))
+        # This backend hands the body to JavaScript instead of iterating it, so
+        # it has to record the send itself for retries to be safe.
+        mark_replayable_body_sent(body)
         if headers:
             for k, v in headers.items():
                 request.set_header(k, v)

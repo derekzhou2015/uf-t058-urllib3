@@ -1,0 +1,7 @@
+Fixed retries and redirects silently sending an empty body when the request body
+is a one-shot iterator, such as a generator or the result of ``iter([...])``.
+urllib3 now raises :class:`~urllib3.exceptions.UnrewindableBodyError` before
+re-sending a body whose iterator has already been consumed, instead of sending
+an empty body that the server could accept with a successful status. Bodies that
+can be replayed, like ``bytes``, ``str``, ``bytearray``, re-iterable containers
+and seekable file-like objects, are unaffected.

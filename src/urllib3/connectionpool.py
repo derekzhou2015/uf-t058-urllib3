@@ -42,7 +42,12 @@ from .exceptions import (
 from .response import BaseHTTPResponse
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
-from .util.request import _TYPE_BODY_POSITION, set_file_position
+from .util.request import (
+    _TYPE_BODY_POSITION,
+    ensure_replayable_body,
+    make_replayable_body,
+    set_file_position,
+)
 from .util.retry import Retry
 from .util.ssl_match_hostname import CertificateError
 from .util.timeout import _DEFAULT_TIMEOUT, _TYPE_DEFAULT, Timeout
@@ -756,6 +761,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         # for future rewinds in the event of a redirect/retry.
         body_pos = set_file_position(body, body_pos)
 
+        # One-shot iterators cannot be sent twice, but only if an attempt has
+        # actually started reading one. Wrap them so a retry can tell the
+        # difference between "not sent yet" and "already consumed".
+        body = make_replayable_body(body)
+
         timeout_obj = self._get_timeout(timeout)
         try:
             # Request a connection from the queue.
@@ -836,6 +846,8 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             retries = retries.increment(
                 method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
             )
+            # A retry re-sends the body, which a consumed iterator cannot do.
+            ensure_replayable_body(body)
             retries.sleep()
 
             # Keep track of the error for the retry warning.
@@ -926,6 +938,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 return response
 
             response.drain_conn()
+            # The redirect is going to re-send the body, which a consumed
+            # iterator cannot do. Refuse rather than silently send nothing.
+            ensure_replayable_body(body)
             retries.sleep_for_retry(response)
             log.debug("Redirecting %s -> %s", url, redirect_location)
             return self.urlopen(
@@ -958,6 +973,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 return response
 
             response.drain_conn()
+            # The retry is going to re-send the body, which a consumed iterator
+            # cannot do. Refuse rather than silently send nothing.
+            ensure_replayable_body(body)
             retries.sleep(response)
             log.debug("Retry: %s", url)
             return self.urlopen(

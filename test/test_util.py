@@ -25,7 +25,16 @@ from urllib3.exceptions import (
 from urllib3.util import is_fp_closed
 from urllib3.util.connection import _has_ipv6, allowed_gai_family, create_connection
 from urllib3.util.proxy import connection_requires_http_tunnel
-from urllib3.util.request import _FAILEDTELL, make_headers, rewind_body
+from urllib3.util.request import (
+    _FAILEDTELL,
+    ensure_replayable_body,
+    is_replayable_body,
+    make_headers,
+    make_replayable_body,
+    mark_replayable_body_sent,
+    rewind_body,
+    unwrap_replayable_body,
+)
 from urllib3.util.response import assert_header_parsing
 from urllib3.util.ssl_ import (
     _is_has_never_check_common_name_reliable,
@@ -919,6 +928,92 @@ class TestUtil:
 
         with pytest.raises(UnrewindableBodyError):
             rewind_body(NoSeek(), body_pos=2)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            None,
+            b"bytes body",
+            "str body",
+            bytearray(b"bytearray body"),
+            memoryview(b"memoryview body"),
+            [b"list", b"body"],
+            (b"tuple", b"body"),
+        ],
+    )
+    def test_is_replayable_body_accepts_replayable_bodies(
+        self, body: typing.Any
+    ) -> None:
+        assert is_replayable_body(body) is True
+        # Wrapping is a no-op for bodies that can be re-sent as-is.
+        assert make_replayable_body(body) is body
+    def test_is_replayable_body_accepts_file_like(self) -> None:
+        # File-like bodies are made replayable by set_file_position() and
+        # rewind_body(), not by this check.
+        body = io.BytesIO(b"file body")
+        assert is_replayable_body(body) is True
+        assert make_replayable_body(body) is body
+
+    @pytest.mark.parametrize("body_factory", [lambda: iter([b"x"]), lambda: iter(())])
+    def test_is_replayable_body_rejects_iterators(
+        self, body_factory: typing.Callable[[], typing.Iterator[bytes]]
+    ) -> None:
+        body = body_factory()
+        assert is_replayable_body(body) is False
+        # Iterators are wrapped so that consumption can be detected later.
+        assert make_replayable_body(body) is not body
+
+    def test_make_replayable_body_is_idempotent(self) -> None:
+        recorder = make_replayable_body(iter([b"x"]))
+        assert make_replayable_body(recorder) is recorder
+
+    def test_recorder_allows_replay_before_consumption(self) -> None:
+        # A retry that fails before the body is read must still send it.
+        recorder = make_replayable_body(iter([b"one", b"two"]))
+        ensure_replayable_body(recorder)
+
+        assert list(recorder) == [b"one", b"two"]
+
+    def test_recorder_rejects_replay_after_consumption(self) -> None:
+        recorder = make_replayable_body(iter([b"one", b"two"]))
+        assert list(recorder) == [b"one", b"two"]
+
+        with pytest.raises(
+            UnrewindableBodyError, match="iterator that has already been consumed"
+        ):
+            ensure_replayable_body(recorder)
+
+    def test_recorder_rejects_replay_after_partial_consumption(self) -> None:
+        recorder = make_replayable_body(iter([b"one", b"two"]))
+        iterator = iter(recorder)
+        assert next(iterator) == b"one"
+
+        with pytest.raises(UnrewindableBodyError):
+            ensure_replayable_body(recorder)
+
+    def test_unwrap_replayable_body(self) -> None:
+        body = iter([b"one"])
+        assert unwrap_replayable_body(body) is body
+        assert unwrap_replayable_body(make_replayable_body(body)) is body
+
+    def test_mark_replayable_body_sent_blocks_replay(self) -> None:
+        # Backends that cannot observe iteration, like the Emscripten bridge,
+        # report the send themselves.
+        recorder = make_replayable_body(iter([b"one"]))
+        ensure_replayable_body(recorder)
+        mark_replayable_body_sent(recorder)
+
+        with pytest.raises(UnrewindableBodyError):
+            ensure_replayable_body(recorder)
+
+    def test_mark_replayable_body_sent_ignores_other_bodies(self) -> None:
+        body = [b"one"]
+        mark_replayable_body_sent(body)
+        ensure_replayable_body(body)
+
+    def test_ensure_replayable_body_allows_repeatable_bodies(self) -> None:
+        for body in (None, b"bytes", "str", bytearray(b"bytearray"), [b"list"]):
+            ensure_replayable_body(body)
 
     def test_add_stderr_logger(self) -> None:
         handler = add_stderr_logger(level=logging.INFO)  # Don't actually print debug

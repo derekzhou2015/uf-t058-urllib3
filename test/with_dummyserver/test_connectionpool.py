@@ -1480,8 +1480,62 @@ class TestFileBodiesOnRetryOrRedirect(DualHypercornDummyServerTestCase):
                 RequestHistory("PUT", "/successful_retry", None, 418, None),
             )
 
-    def test_redirect_put_file(self, pool_factory: PoolFactory) -> None:
-        """PUT with file object should work with a redirection response"""
+    @pytest.mark.usefixtures("reset_retry_state")
+    def test_retrying_iterator_body_is_refused_not_sent_empty(
+        self, pool_factory: PoolFactory
+    ) -> None:
+        """A retried iterator body must be refused instead of sent empty.
+
+        /successful_retry answers 418 first, which consumes the iterator. The
+        retry used to re-send it as an empty chunked body and report the
+        server's 200 as success, losing the upload silently.
+        """
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            with pytest.raises(
+                UnrewindableBodyError, match="iterator that has already been consumed"
+            ):
+                pool.urlopen(
+                    "PUT",
+                    "/successful_retry",
+                    headers={"test-name": "test_retrying_iterator_body"},
+                    retries=Retry(total=3, status_forcelist=[418]),
+                    body=iter([b"payload"]),
+                    redirect=False,
+                )
+
+    def test_redirecting_iterator_body_is_refused_not_sent_empty(
+        self, pool_factory: PoolFactory
+    ) -> None:
+        """A 307 redirect must not re-send a consumed iterator as an empty body."""
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            with pytest.raises(
+                UnrewindableBodyError, match="iterator that has already been consumed"
+            ):
+                pool.urlopen(
+                    "PUT",
+                    "/redirect?target=/echo&status=307",
+                    body=iter([b"payload"]),
+                    assert_same_host=False,
+                    redirect=True,
+                )
+
+    @pytest.mark.usefixtures("reset_retry_state")
+    def test_retrying_repeatable_body_is_still_replayed(
+        self, pool_factory: PoolFactory
+    ) -> None:
+        """Bytes and list bodies keep being replayed on retries and redirects."""
+        with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
+            for body in (b"payload", [b"payload"]):
+                resp = pool.urlopen(
+                    "PUT",
+                    "/redirect?target=/echo&status=307",
+                    body=body,
+                    assert_same_host=False,
+                )
+                assert resp.status == 200
+                assert resp.data == b"payload"
+
+    def test_redirect_put_file(self, pool_factory: PoolFactory) -> None:        """PUT with file object should work with a redirection response"""
         with pool_factory(self.host, self.port, timeout=LONG_TIMEOUT) as pool:
             retry = Retry(total=3, status_forcelist=[418])
             # httplib reads in 8k chunks; use a larger content length

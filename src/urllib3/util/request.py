@@ -230,6 +230,145 @@ class ChunksAndContentLength(typing.NamedTuple):
     content_length: int | None
 
 
+def is_replayable_body(body: typing.Any) -> bool:
+    """
+    Whether ``body`` can safely be sent more than once.
+
+    ``bytes``, ``str``, objects implementing the buffer protocol and
+    re-iterable containers (such as ``list``) produce a fresh iterable on every
+    attempt and can always be replayed. File-like objects are handled by
+    :func:`set_file_position` and :func:`rewind_body`, which record and restore
+    their position, so they are reported as replayable here.
+
+    One-shot iterators, such as generators and the result of ``iter([...])``,
+    cannot be replayed: once an attempt has consumed them, a second attempt
+    would send an empty body without anybody noticing.
+    """
+    if body is None or isinstance(body, (str, bytes)) or hasattr(body, "read"):
+        return True
+
+    try:
+        # Same detection as body_to_chunks(): buffer-protocol objects can be
+        # sent as-is on every attempt.
+        memoryview(body)
+    except TypeError:
+        pass
+    else:
+        return True
+
+    try:
+        # An iterator is its own iterator, and can therefore be walked once.
+        return iter(body) is not body
+    except TypeError:
+        # Not iterable at all; body_to_chunks() reports that on its own.
+        return True
+
+
+class _ReplayableBodyRecorder:
+    """
+    Tracks whether a one-shot iterator body has actually been consumed.
+
+    A retry after a connection error happens before the body is ever read, so
+    the same iterator can still be sent in full. Only once an attempt starts
+    iterating the body does replay become impossible. This wrapper observes
+    that first consumption; whoever retries or follows redirects creates one
+    per request and carries it across attempts, and
+    :func:`ensure_replayable_body` refuses to re-send a body that this wrapper
+    has seen consumed.
+
+    Bodies that are replayable on their own are never wrapped, so the common
+    paths are untouched.
+    """
+
+    __slots__ = ("body", "consumed")
+
+    def __init__(self, body: typing.Iterable[typing.Any]) -> None:
+        self.body = body
+        self.consumed = False
+
+    def __iter__(self) -> typing.Iterator[typing.Any]:
+        for chunk in self.body:
+            # Any attempt that pulls a chunk has consumed the underlying
+            # iterator, whether or not the chunk reaches the server.
+            self.consumed = True
+            yield chunk
+
+    def __repr__(self) -> str:
+        return f"<replayable body recorder for {self.body!r}>"
+
+    def mark_consumed(self) -> None:
+        """
+        Record that the body may have been consumed.
+
+        Backends that cannot observe iteration (the Emscripten bridge hands the
+        object to JavaScript) call this before sending, so a later retry is
+        refused instead of gambling on an empty body.
+        """
+        self.consumed = True
+
+    def ensure_not_consumed(self) -> None:
+        if self.consumed:
+            raise UnrewindableBodyError(
+                "Unable to re-send the request body for a retry or redirect: "
+                "the body is an iterator that has already been consumed, so "
+                "the next attempt would send an empty body. Pass a bytes-like "
+                "object, a re-iterable container, or a seekable file-like "
+                "object as the body to make the request replayable."
+            )
+
+
+def make_replayable_body(body: typing.Any) -> typing.Any:
+    """
+    Wrap a one-shot iterator body so consumption can be detected later.
+
+    Returns ``body`` unchanged when it is already replayable or already
+    wrapped, which makes this safe to call at every entry point that may retry
+    or follow redirects.
+    """
+    if isinstance(body, _ReplayableBodyRecorder) or is_replayable_body(body):
+        return body
+    return _ReplayableBodyRecorder(body)
+
+
+def unwrap_replayable_body(body: typing.Any) -> typing.Any:
+    """
+    Return the body a :func:`make_replayable_body` wrapper stands for.
+
+    Backends that hand the body to something other than a Python iterator (for
+    example the Emscripten fetch bridge) use this to keep receiving the exact
+    object the caller passed. Such backends must also call
+    :meth:`_ReplayableBodyRecorder.mark_consumed` once they have sent it,
+    because they cannot record consumption any other way.
+    """
+    if isinstance(body, _ReplayableBodyRecorder):
+        return body.body
+    return body
+
+
+def mark_replayable_body_sent(body: typing.Any) -> None:
+    """
+    Declare that ``body`` has been handed to a backend that consumed it.
+
+    Backends which never iterate the body themselves (the Emscripten bridge
+    passes it to JavaScript) call this once they have sent it, so a retry or
+    redirect does not re-send an iterator that is already gone.
+    """
+    if isinstance(body, _ReplayableBodyRecorder):
+        body.mark_consumed()
+
+
+def ensure_replayable_body(body: typing.Any) -> None:
+    """
+    Refuse to re-send a request whose body cannot be replayed.
+
+    Called right before a retry or redirect re-issues a request. Replaying a
+    consumed iterator silently sends an empty body, which the server may accept
+    with a successful status, so it is rejected explicitly instead.
+    """
+    if isinstance(body, _ReplayableBodyRecorder):
+        body.ensure_not_consumed()
+
+
 def body_to_chunks(
     body: typing.Any | None, method: str, blocksize: int
 ) -> ChunksAndContentLength:

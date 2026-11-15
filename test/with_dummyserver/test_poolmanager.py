@@ -16,7 +16,7 @@ from dummyserver.testcase import (
 )
 from urllib3 import HTTPHeaderDict, HTTPResponse, request
 from urllib3.connectionpool import port_by_scheme
-from urllib3.exceptions import MaxRetryError, URLSchemeUnknown
+from urllib3.exceptions import MaxRetryError, UnrewindableBodyError, URLSchemeUnknown
 from urllib3.poolmanager import PoolManager
 from urllib3.util.retry import Retry
 
@@ -474,6 +474,32 @@ class TestPoolManager(DualHypercornDummyServerTestCase):
             )
         assert response.status == 200
         assert response.data == b""
+
+    def test_redirect_rejects_consumed_iterator_body(
+        self, pool_manager_factory: PoolManagerFactory
+    ) -> None:
+        """PoolManager follows redirects itself, and must refuse here too."""
+        with pool_manager_factory() as http:
+            with pytest.raises(
+                UnrewindableBodyError, match="iterator that has already been consumed"
+            ):
+                http.urlopen(
+                    "PUT",
+                    f"{self.base_url}/redirect?target={self.base_url}/echo&status=307",
+                    body=iter([b"payload"]),
+                )
+
+    def test_redirect_replays_repeatable_body(
+        self, pool_manager_factory: PoolManagerFactory
+    ) -> None:
+        with pool_manager_factory() as http:
+            response = http.urlopen(
+                "PUT",
+                f"{self.base_url}/redirect?target={self.base_url}/echo&status=307",
+                body=[b"payload"],
+            )
+        assert response.status == 200
+        assert response.data == b"payload"
 
     def test_unknown_scheme(self, pool_manager_factory: PoolManagerFactory) -> None:
         with pool_manager_factory() as http:
